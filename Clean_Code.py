@@ -1,14 +1,40 @@
+"""Flask application that reviews source code with LangChain and an OpenAI model.
+
+The HTML template posts one of three workflows to the root route: an educational
+review, a quick refactor, or a public GitHub repository audit.  This module keeps
+the web layer separate from LLM calls and source-file collection so each part can
+be changed or tested independently.
+
+Required environment variable: OPENAI_API_KEY
+Optional environment variable: CLEAN_CODE_MODEL (defaults to gpt-4.1-mini)
+"""
+
+# Standard-library modules handle files, ZIP archives, URLs, and pattern matching.
 import os
 import io
 import re
 import zipfile
+
+# requests is only used for public GitHub API and raw-file calls.
 import requests
 from urllib.parse import quote
-from flask import Flask, render_template, request
-from google import genai
-from google.genai import types
 
+# Flask request field names deliberately match clean_code.html.
+from flask import Flask, render_template, request
+
+# LangChain provides a provider-neutral interface.  This app uses the OpenAI
+# integration, but the Flask routes below do not need to change if a different
+# LangChain chat model is selected later.
+try:
+    from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_openai import ChatOpenAI
+except ImportError:
+    JsonOutputParser = StrOutputParser = ChatPromptTemplate = ChatOpenAI = None
+
+# Flask automatically searches for clean_code.html in a sibling templates folder.
 app = Flask(__name__)
+# Reject unexpectedly large uploads before loading them into memory.
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB max upload limit
 
 
@@ -37,17 +63,22 @@ LANGUAGE_BY_EXTENSION = {
 
 def language_for_filename(filename: str) -> str:
     """Return the programming language inferred from a file name."""
+    # splitext is safer than checking suffixes manually because it normalizes
+    # multi-character extensions such as .cpp and ignores the directory portion.
     extension = os.path.splitext(filename.lower())[1]
     return LANGUAGE_BY_EXTENSION.get(extension, 'Unknown')
 
 
 def is_supported_source_file(filename: str) -> bool:
+    """Keep unsupported files out of ZIP extraction and GitHub processing."""
     return language_for_filename(filename) != 'Unknown'
 
 
 def detect_language_from_code(code: str) -> str:
     """Best-effort language detection for code pasted without a filename."""
     normalized = code.strip()
+    # These checks are intentionally conservative.  They only guide the review
+    # prompt; they do not parse, execute, or validate untrusted user code.
     if re.search(r'^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|WITH)\b', normalized, re.I):
         return 'SQL'
     if re.search(r'^\s*(#include\s*[<"]|using\s+namespace\s+|std::)', normalized, re.M):
@@ -60,12 +91,32 @@ def detect_language_from_code(code: str) -> str:
 
 
 class CleanCodeReviewer:
-    """Multi-Agent reviewer handling Educational, Quick Fix, and Repository Audit modes."""
+    """LangChain-backed reviewer for the three modes exposed by the HTML page."""
 
-    def __init__(self, model_name: str = "gemini-3.6-flash"):
-        self.api_key = os.getenv('GEMINI_API_KEY')
-        self.client = genai.Client(api_key=self.api_key) if self.api_key else None
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = None):
+        # Keep the model configurable without exposing another form field.  This
+        # lets deployment set CLEAN_CODE_MODEL while local users use the default.
+        self.model_name = model_name or os.getenv("CLEAN_CODE_MODEL", "gpt-4.1-mini")
+        self.api_key = os.getenv("OPENAI_API_KEY")
+
+    def _configuration_error(self) -> str | None:
+        """Return an actionable message rather than failing during a POST request."""
+        if ChatOpenAI is None:
+            return (
+                "Error: LangChain is not installed. Run "
+                "`pip install langchain-core langchain-openai`."
+            )
+        if not self.api_key:
+            return "Error: OPENAI_API_KEY is missing from environment variables."
+        return None
+
+    def _chat_model(self, temperature: float) -> ChatOpenAI:
+        """Create a fresh LangChain chat model with the mode's creativity level."""
+        return ChatOpenAI(
+            model=self.model_name,
+            temperature=temperature,
+            api_key=self.api_key,
+        )
 
     def review_educational(self, code: str, language: str = 'the detected source language') -> str:
         """Mode 1: Full architectural breakdown and explanation."""
@@ -96,57 +147,80 @@ class CleanCodeReviewer:
             "Respond in JSON format with keys:\n"
             "- 'is_clean': boolean\n"
             "- 'summary': brief sentence of findings\n"
-            "- 'refactored_code': string with clean python code if not clean, else original"
+            "- 'refactored_code': string with clean code in the file's original language if not clean, else original"
         )
+        configuration_error = self._configuration_error()
+        if configuration_error:
+            return {"is_clean": True, "summary": configuration_error, "refactored_code": code}
+
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=f"File: {filename}\n\nCode:\n{code}",
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    temperature=0.1
-                )
-            )
-            import json
-            return json.loads(response.text)
+            # JsonOutputParser validates that the model returns a JSON object and
+            # converts it to a Python dictionary for the existing HTML template.
+            parser = JsonOutputParser()
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_instruction),
+                ("human", "File: {filename}\n\nCode:\n{code}\n\n{format_instructions}"),
+            ])
+            chain = prompt | self._chat_model(temperature=0.1) | parser
+            audit = chain.invoke({
+                "filename": filename,
+                "code": code,
+                "format_instructions": parser.get_format_instructions(),
+            })
+            return {
+                "is_clean": bool(audit.get("is_clean", True)),
+                "summary": str(audit.get("summary", "")),
+                "refactored_code": str(audit.get("refactored_code", code)),
+            }
         except Exception as e:
             return {"is_clean": True, "summary": f"Error auditing file: {str(e)}", "refactored_code": code}
 
     def _generate(self, prompt: str, system_instruction: str, temperature: float) -> str:
-        if not self.client:
-            return "Error: GEMINI_API_KEY is missing from environment variables."
+        configuration_error = self._configuration_error()
+        if configuration_error:
+            return configuration_error
         try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=temperature
-                )
+            # A prompt template keeps instructions separate from user-provided
+            # code.  StrOutputParser extracts the text from LangChain's AIMessage.
+            chain = (
+                ChatPromptTemplate.from_messages([
+                    ("system", system_instruction),
+                    ("human", "Code to review:\n{code}"),
+                ])
+                | self._chat_model(temperature)
+                | StrOutputParser()
             )
-            return response.text
+            return chain.invoke({"code": prompt})
         except Exception as e:
             return f"Error during analysis: {str(e)}"
 
 
 def extract_source_code_from_upload(file_storage) -> str:
     """Extract supported source files from an upload or a ZIP archive."""
+    # Werkzeug provides the upload as a stream.  Lowercasing makes extension
+    # handling consistent for files such as PROGRAM.JS and program.js.
     filename = file_storage.filename.lower()
     
     if is_supported_source_file(filename):
+        # errors='ignore' lets the reviewer handle imperfectly encoded source
+        # files instead of failing the entire HTTP request.
         return file_storage.read().decode('utf-8', errors='ignore')
         
     elif filename.endswith('.zip'):
         extracted_code = []
         with zipfile.ZipFile(io.BytesIO(file_storage.read())) as z:
             for zip_info in z.infolist():
+                # Ignore directory entries and macOS metadata.  Only listed
+                # source extensions are read, preventing binary files entering
+                # the LLM prompt.
                 if (not zip_info.is_dir() and not zip_info.filename.startswith('__MACOSX')
                         and is_supported_source_file(zip_info.filename)):
                     with z.open(zip_info) as f:
                         code_content = f.read().decode('utf-8', errors='ignore')
                         language = language_for_filename(zip_info.filename)
                         extracted_code.append(
+                            # A per-file marker helps the model distinguish files
+                            # when a ZIP contains a multi-language project.
                             f"// --- File: {zip_info.filename} ({language}) ---\n{code_content}\n"
                         )
         return "\n".join(extracted_code) if extracted_code else "No supported source files found in ZIP archive."
@@ -156,16 +230,22 @@ def extract_source_code_from_upload(file_storage) -> str:
 
 def fetch_github_source_files(repo_url: str) -> dict:
     """Fetch supported source files from a public GitHub repository."""
+    # The route accepts a normal GitHub URL, so extract only owner/repository
+    # segments before constructing GitHub API URLs.
     match = re.search(r"github\.com/([^/]+)/([^/.]+)", repo_url)
     if not match:
         return {"error": "Invalid GitHub repository URL format."}
 
     owner, repo = match.group(1), match.group(2)
+    # First read repository metadata rather than assuming main/master.  This
+    # supports repositories whose default branch has a custom name.
     repo_response = requests.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=15)
     if repo_response.status_code != 200:
         return {"error": f"Failed to fetch repository. Status code: {repo_response.status_code}"}
 
     default_branch = repo_response.json().get('default_branch', 'main')
+    # quote prevents a branch name containing URL-reserved characters from
+    # changing the API request path.
     api_url = (
         f"https://api.github.com/repos/{owner}/{repo}/git/trees/"
         f"{quote(default_branch, safe='')}?recursive=1"
@@ -174,11 +254,15 @@ def fetch_github_source_files(repo_url: str) -> dict:
     if res.status_code != 200:
         return {"error": f"Failed to fetch repository. Status code: {res.status_code}"}
 
+    # A recursive tree returns file metadata, not file bodies.  Download only
+    # supported blob entries in the loop below.
     tree = res.json().get('tree', [])
     source_files = {}
 
     for item in tree:
         if item['type'] == 'blob' and is_supported_source_file(item['path']):
+            # Keep slashes in the file path so nested directories remain valid
+            # while escaping characters that could break the raw GitHub URL.
             raw_url = (
                 f"https://raw.githubusercontent.com/{owner}/{repo}/"
                 f"{quote(default_branch, safe='')}/{quote(item['path'], safe='/')}"
@@ -192,6 +276,9 @@ def fetch_github_source_files(repo_url: str) -> dict:
 
 @app.route('/', methods=['GET', 'POST'])
 def index():
+    """Render the page on GET and dispatch the selected HTML tab on POST."""
+    # `active_tab` is a hidden input in each form.  Passing it back to the
+    # template ensures the user returns to the same tab after submission.
     active_tab = request.form.get('active_tab', 'edu')
     dirty_code = ""
     feedback = None
@@ -199,11 +286,15 @@ def index():
     error = None
 
     if request.method == 'POST':
+        # Create one reviewer per request.  The model client has no request
+        # state, which avoids accidentally sharing user code between requests.
         reviewer = CleanCodeReviewer()
 
         # MODE 1: Educational
         if active_tab == 'edu':
             if 'file_upload' in request.files and request.files['file_upload'].filename != '':
+                # Field name is kept in sync with the educational upload input
+                # in clean_code.html.
                 uploaded_file = request.files['file_upload']
                 dirty_code = extract_source_code_from_upload(uploaded_file)
                 language = (
@@ -211,6 +302,8 @@ def index():
                     else language_for_filename(uploaded_file.filename)
                 )
             else:
+                # Pasted code has no extension, so use lightweight detection to
+                # provide the LLM with the most appropriate language context.
                 dirty_code = request.form.get('dirty_code', '')
                 language = detect_language_from_code(dirty_code)
             feedback = reviewer.review_educational(dirty_code, language)
@@ -238,6 +331,8 @@ def index():
                 error = repo_data["error"]
             else:
                 github_results = []
+                # Keep the result keys stable because the HTML uses
+                # item.file, item.is_clean, item.summary, and item.refactored_code.
                 for filepath, code_content in repo_data["files"].items():
                     audit = reviewer.review_github_file(filepath, code_content)
                     github_results.append({
@@ -247,6 +342,8 @@ def index():
                         "refactored_code": audit.get("refactored_code", "")
                     })
 
+    # The template receives the same context keys for GET and POST.  Empty
+    # values are harmless and let Jinja conditionally hide result sections.
     return render_template(
         'clean_code.html',
         active_tab=active_tab,
@@ -258,4 +355,6 @@ def index():
 
 
 if __name__ == '__main__':
+    # Debug mode is suitable for local development only.  Use a production WSGI
+    # server and disable debug mode when deploying the application publicly.
     app.run(debug=True, port=5000)
